@@ -1,0 +1,4 @@
+interface:
+  display_name: "H3 视频创作助手（8.4版）"
+  short_description: "选择 FL2VA 或 Ref2VA，生成官方结构化 H3 提示词"
+  default_prompt: "使用 $h3-video-prompt-director 判断 H3 模型与任务模式，并生成适合本地开源 H3-Base 或海螺网页端的可直接使用提示词。"
