@@ -29,6 +29,8 @@ Hermes API 生成可直接使用的 H3 视频提示词。Hermes 端会自动激�
 - **Optional output language** — `english` (default, ComfyUI/H3-Base
   executable), `chinese`, or `both`.
 - **Optional temp-file retention** for debugging.
+- **Optional prompt cache** — when `enable_cache=True`, identical inputs
+  return the previous `prompt` without calling Hermes.
 - **Timeout up to 24 hours** for very long video-analysis jobs.
 
 ---
@@ -43,6 +45,7 @@ Hermes API 生成可直接使用的 H3 视频提示词。Hermes 端会自动激�
 - **可指定输出语言** —— `english`（默认，ComfyUI / H3-Base 可执行版本）、
   `chinese`、`both`。
 - **可选保留临时文件** —— 调试用。
+- **可选 prompt 缓存** —— `enable_cache=True` 时，相同输入直接返回上次 `prompt`，不调 Hermes。
 - **超时最大 24 小时** —— 应对超长视频分析任务。
 
 ---
@@ -79,6 +82,8 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 | `model` | STRING | optional | `MiniMax-M3` | model name passed to Hermes |
 | `output_language` | enum | optional | `english` | `english` / `chinese` / `both` |
 | `keep_temp_files` | BOOLEAN | optional | `False` | retain `/tmp/h3-prompt-director/<uuid>/` for debugging |
+| `enable_cache` | BOOLEAN | optional | `False` | when `True`, identical inputs return the previous `prompt` without calling Hermes |
+| `cache_dir` | STRING | optional | `/tmp/h3-prompt-director/cache` | where cache entries live; pick a persistent path if you want them across reboots |
 | `timeout` | INT | optional | 300 | seconds, max 86400 (24h) |
 
 | 槽 | 类型 | 必填 | 默认 | 说明 |
@@ -94,6 +99,8 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 | `model` | STRING | optional | `MiniMax-M3` | 传给 Hermes 的模型名 |
 | `output_language` | enum | optional | `english` | `english` / `chinese` / `both` |
 | `keep_temp_files` | BOOLEAN | optional | `False` | 保留 `/tmp/h3-prompt-director/<uuid>/` 调试用 |
+| `enable_cache` | BOOLEAN | optional | `False` | `True` 时，相同输入直接返回上次 `prompt`，不调用 Hermes |
+| `cache_dir` | STRING | optional | `/tmp/h3-prompt-director/cache` | 缓存目录；若想跨重启保留，改成持久路径（如 `~/.cache/h3-prompt-director/`） |
 | `timeout` | INT | optional | 300 | 秒， 上限 86400（24h） |
 
 ---
@@ -332,6 +339,38 @@ ComfyUI-H3PromptDirector/
 
 ---
 
+## Caching / 缓存
+
+When `enable_cache=True`, the node records each successful Hermes response
+under a SHA-256 key derived from **all** inputs that affect the result:
+
+- a SHA-256 of every image file's bytes
+- a SHA-256 of the encoded video file's bytes
+- `video_fps`, `goal`, `skill_name`, `api_url`, `api_key`, `model`, `output_language`
+
+On subsequent runs with byte-identical inputs (and the same `api_url` /
+`api_key` / `model` / `output_language`), the cached `prompt` and
+`raw` are returned **without contacting Hermes**. Cache writes are atomic
+(`*.json.tmp` + rename) and the directory is LRU-trimmed to the most
+recent 100 entries.
+
+> ⚠️ Defaults to `False`. Set `enable_cache=True` and (optionally) point
+> `cache_dir` at a persistent location like `~/.cache/h3-prompt-director/`
+> if you want the cache to survive reboots — `/tmp/...` is wiped by the
+> OS on most Linux distributions.
+
+打开 `enable_cache` 后，节点会用 SHA-256 缓存函数返回 prompt 和 raw。
+缓存键覆盖所有影响结果的输入：每张图片、整个视频文件、fps、goal、
+skill_name、api_url、api_key、model、output_language。下次相同输入
+完全一致时直接读缓存，不发 API 请求。写入用 `tmp + rename` 原子写，
+按 LRU 最多保留 100 条。
+
+> ⚠️ 默认 `False`。如需跨重启保留，**设置 `cache_dir` 为持久路径**
+> （如 `~/.cache/h3-prompt-director/`），因为默认 `/tmp/...` 会被
+> 系统清理。
+
+---
+
 ## Troubleshooting / 故障排查
 
 | Symptom | Likely cause | Fix |
@@ -341,6 +380,7 @@ ComfyUI-H3PromptDirector/
 | `Connection refused` to `192.168.3.78:8642` | Hermes API server not enabled / wrong host | Update the node's `api_url` input; verify with `curl http://<host>:8642/health` |
 | `unsupported content_type` | Hermes API rejected — should not happen, only `image_url` + text are sent | Check Hermes server logs |
 | `keep_temp_files` output is empty | Cleanup ran (default `False`) | Toggle `keep_temp_files=True` to inspect `/tmp/h3-prompt-director/<uuid>/` |
+| Cache HIT but `prompt` is stale | You changed some upstream node (e.g. model, sampler) but the input bytes are still the same | Disable `enable_cache` to force a fresh call, or change `goal` to bust the cache key |
 
 | 现象 | 可能原因 | 修复 |
 |---|---|---|
@@ -349,3 +389,4 @@ ComfyUI-H3PromptDirector/
 | 连接 `192.168.3.78:8642` 拒绝 | Hermes API server 未启用 / 主机错 | 改 `api_url` 输入；用 `curl http://<host>:8642/health` 验证 |
 | `unsupported content_type` | Hermes API 拒绝 —— 节点只发 `image_url` + text | 检查 Hermes 服务日志 |
 | `keep_temp_files` 输出为空 | 清理已跑（默认 `False`） | 设 `keep_temp_files=True` 查看 `/tmp/h3-prompt-director/<uuid>/` |
+| Cache HIT 但 `prompt` 旧 | 上游节点（如模型、采样器）换了，但输入字节相同 | 关闭 `enable_cache` 强制重发，或改 `goal` 让 cache key 失效 |

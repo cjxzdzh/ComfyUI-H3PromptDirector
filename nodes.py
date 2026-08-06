@@ -32,6 +32,7 @@ Outputs
                     inspection / debugging). Empty string after cleanup.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -55,6 +56,10 @@ DEFAULT_GOAL = "让图1的角色模仿参考视频的角色跳舞，保留图1�
 DEFAULT_TIMEOUT = 300
 DEFAULT_VIDEO_FPS = 24.0
 MAX_TIMEOUT = 86400  # 24 hours
+
+DEFAULT_ENABLE_CACHE = False
+DEFAULT_CACHE_DIR = "/tmp/h3-prompt-director/cache"
+CACHE_MAX_ENTRIES = 100  # LRU cap
 
 TEMP_ROOT = "/tmp/h3-prompt-director"
 
@@ -225,6 +230,104 @@ def _cleanup_temp_dir(d: str):
             shutil.rmtree(d, ignore_errors=True)
     except Exception as e:
         print(f"[H3PromptDirector] cleanup warning for {d}: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _file_sha256(path: str) -> str:
+    """SHA-256 of a file's content. Returns empty string on failure."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _compute_cache_key(image_paths, video_path, goal, skill_name,
+                       api_url, api_key, model, output_language, video_fps):
+    """Stable SHA-256 over a canonical JSON of all inputs that affect Hermes output.
+
+    `api_key` is part of the key — different keys may run against different
+    Hermes configurations / users / sessions, so we partition cache by it.
+    """
+    payload = {
+        "image_hashes": [_file_sha256(p) for p in image_paths],
+        "video_hash": _file_sha256(video_path) if video_path else "",
+        "video_fps": float(video_fps) if video_fps else DEFAULT_VIDEO_FPS,
+        "goal": goal.strip(),
+        "skill_name": skill_name,
+        "api_url": api_url,
+        "api_key": api_key,
+        "model": model,
+        "output_language": output_language,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _cache_get(cache_dir: str, key: str):
+    """Return (prompt, raw, saved_at) if cache hit, else None."""
+    path = os.path.join(cache_dir, f"{key}.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            entry = json.load(f)
+        if all(k in entry for k in ("prompt", "raw", "saved_at")):
+            return entry["prompt"], entry["raw"], entry["saved_at"]
+    except Exception as e:
+        print(f"[H3PromptDirector] cache read failed for {key}: {e}", flush=True)
+    return None
+
+
+def _cache_put(cache_dir: str, key: str, prompt: str, raw: str):
+    """Write cache entry atomically (tmp + rename). LRU-trim afterwards."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception as e:
+        print(f"[H3PromptDirector] cache mkdir failed: {e}", flush=True)
+        return
+    entry = {"prompt": prompt, "raw": raw, "saved_at": int(time.time())}
+    tmp_path = os.path.join(cache_dir, f"{key}.json.tmp")
+    final_path = os.path.join(cache_dir, f"{key}.json")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+        os.replace(tmp_path, final_path)
+    except Exception as e:
+        print(f"[H3PromptDirector] cache write failed for {key}: {e}", flush=True)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        return
+    _cache_lru_trim(cache_dir)
+
+
+def _cache_lru_trim(cache_dir: str):
+    """Keep the most recent CACHE_MAX_ENTRIES entries by mtime."""
+    try:
+        files = [
+            os.path.join(cache_dir, f)
+            for f in os.listdir(cache_dir)
+            if f.endswith(".json")
+        ]
+        if len(files) <= CACHE_MAX_ENTRIES:
+            return
+        files.sort(key=lambda p: os.path.getmtime(p))
+        for old in files[: len(files) - CACHE_MAX_ENTRIES]:
+            try:
+                os.unlink(old)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[H3PromptDirector] cache lru trim warning: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +549,14 @@ class H3PromptDirector:
                     "default": False,
                     "tooltip": "保留临时文件（用于 debug / 复现）。默认 False，调用后清理。",
                 }),
+                "enable_cache": ("BOOLEAN", {
+                    "default": DEFAULT_ENABLE_CACHE,
+                    "tooltip": "启用 prompt 缓存：相同输入直接返回上次 prompt，不重发 API。",
+                }),
+                "cache_dir": ("STRING", {
+                    "default": DEFAULT_CACHE_DIR,
+                    "placeholder": "缓存目录（建议用非 /tmp 路径以持久化）",
+                }),
                 "timeout": ("INT", {
                     "default": DEFAULT_TIMEOUT,
                     "min": 30,
@@ -470,7 +581,10 @@ class H3PromptDirector:
                  image_2=None, image_3=None, image_4=None, image_5=None,
                  api_url=DEFAULT_API_URL, api_key=DEFAULT_API_KEY,
                  model=DEFAULT_MODEL, output_language="english",
-                 keep_temp_files=False, timeout=DEFAULT_TIMEOUT):
+                 keep_temp_files=False,
+                 enable_cache=DEFAULT_ENABLE_CACHE,
+                 cache_dir=DEFAULT_CACHE_DIR,
+                 timeout=DEFAULT_TIMEOUT):
         t0 = time.time()
         temp_dir = _make_temp_dir()
 
@@ -508,13 +622,34 @@ class H3PromptDirector:
                   f"video={'yes' if video_path else 'no'}, "
                   f"goal={goal[:60]!r}...", flush=True)
 
-            # ---- 3. Call Hermes ----
+            # ---- 3. Cache check (only when enabled) ----
+            cache_key = None
+            if enable_cache:
+                cache_key = _compute_cache_key(
+                    image_paths, video_path, goal, skill_name,
+                    api_url, api_key, model, output_language, video_fps,
+                )
+                hit = _cache_get(cache_dir, cache_key)
+                if hit is not None:
+                    prompt, raw, saved_at = hit
+                    print(f"[H3PromptDirector] cache HIT key={cache_key[:12]}... "
+                          f"saved_at={saved_at}, prompt={len(prompt)} chars, "
+                          f"raw={len(raw)} chars "
+                          f"(total {time.time()-t0:.2f}s)", flush=True)
+                    return (prompt, raw, temp_dir if keep_temp_files else "")
+                print(f"[H3PromptDirector] cache MISS key={cache_key[:12]}...", flush=True)
+
+            # ---- 4. Call Hermes ----
             raw = _call_hermes(
                 api_url=api_url, api_key=api_key, model=model,
                 image_paths=image_paths, video_path=video_path, goal=goal,
                 skill_name=skill_name, timeout=timeout,
             )
             prompt = _clean_response(raw, prefer=output_language)
+
+            # ---- 5. Cache write (only when enabled) ----
+            if enable_cache and cache_key:
+                _cache_put(cache_dir, cache_key, prompt, raw)
 
             print(f"[H3PromptDirector] done in {time.time()-t0:.1f}s, "
                   f"prompt={len(prompt)} chars, raw={len(raw)} chars", flush=True)
