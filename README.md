@@ -16,12 +16,13 @@ Hermes API 生成可直接使用的 H3 视频提示词。Hermes 端会自动激�
 
 - **Up to 5 reference images** (ComfyUI `IMAGE` type) — characters, scenes,
   styles, key frames, anything.
-- **1 reference video** (ComfyUI `IMAGE` batch — the standard ComfyUI
+- **0 or 1 reference video** (ComfyUI `IMAGE` batch — the standard ComfyUI
   convention where video loaders emit a per-frame float tensor). The
-  node re-encodes the frame batch to a real mp4 on disk so the receiving
-  agent can read it.
+  video is **optional** — the node works fine with just an image and a
+  goal. When provided, the node re-encodes the frame batch to a real
+  mp4 on disk so the receiving agent can read it.
 - **Configurable video FPS** — required because the IMAGE batch carries
-  no timing metadata.
+  no timing metadata. Only used when a video is supplied.
 - **Customizable goal** describing what the user wants in plain Chinese
   or English.
 - **Configurable skill name** — point the receiving agent at any
@@ -36,10 +37,11 @@ Hermes API 生成可直接使用的 H3 视频提示词。Hermes 端会自动激�
 ---
 
 - **最多 5 张参考图**（ComfyUI `IMAGE` 类型）—— 人物、场景、风格、关键帧等。
-- **1 段参考视频**（ComfyUI `IMAGE` batch —— ComfyUI 视频加载器输出的标准
-  形态：每帧一个 float tensor）。节点自动把帧 batch 重编码成 mp4，让
+- **0 或 1 段参考视频**（ComfyUI `IMAGE` batch —— ComfyUI 视频加载器输出的标准
+  形态：每帧一个 float tensor）。**视频是可选的** —— 只输入图 + 一句话目标
+  也能生成 H3 提示词。提供视频时，节点自动把帧 batch 重编码成 mp4，让
   接收端 agent 直接读。
-- **可配置视频帧率（FPS）** —— IMAGE batch 不带时间元信息，必须告诉节点。
+- **可配置视频帧率（FPS）** —— IMAGE batch 不带时间元信息，提供视频时填。
 - **可自定义目标** —— 中文 / 英文，自然语言描述。
 - **可自定义技能名** —— 告诉 Hermes 激活哪个技能，默认 `h3-video-prompt-director`。
 - **可指定输出语言** —— `english`（默认，ComfyUI / H3-Base 可执行版本）、
@@ -71,10 +73,10 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 
 | Slot | Type | Required | Default | Notes |
 |------|------|----------|---------|-------|
-| `image_1` | IMAGE | ✓ | — | 1st reference image |
+| `image_1` | IMAGE | ✓ | — | 1st reference image (required) |
 | `image_2` … `image_5` | IMAGE | optional | `None` | additional references |
-| `reference_video` | IMAGE | ✓ | — | the standard per-frame batch from VHS / VRGDG / etc. |
-| `video_fps` | FLOAT | ✓ | 24.0 | frames per second of the reference video |
+| `reference_video` | IMAGE | optional | `None` | the standard per-frame batch from VHS / VRGDG / etc. — optional |
+| `video_fps` | FLOAT | optional | 24.0 | frames per second of the reference video (only used when video is provided) |
 | `goal` | STRING | ✓ | (Chinese example) | what the user wants |
 | `skill_name` | STRING | ✓ | `h3-video-prompt-director` | the Hermes skill to activate |
 | `api_url` | STRING | optional | `http://192.168.3.78:8642` | Hermes API base URL |
@@ -88,10 +90,10 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 
 | 槽 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
-| `image_1` | IMAGE | ✓ | — | 第 1 张参考图 |
+| `image_1` | IMAGE | ✓ | — | 第 1 张参考图（必填） |
 | `image_2` … `image_5` | IMAGE | optional | `None` | 额外参考图 |
-| `reference_video` | IMAGE | ✓ | — | VHS / VRGDG 等加载器输出的逐帧 batch |
-| `video_fps` | FLOAT | ✓ | 24.0 | 参考视频帧率 |
+| `reference_video` | IMAGE | optional | `None` | VHS / VRGDG 等加载器输出的逐帧 batch（可选） |
+| `video_fps` | FLOAT | optional | 24.0 | 参考视频帧率（仅在提供视频时使用） |
 | `goal` | STRING | ✓ | （中文示例） | 用户目标 |
 | `skill_name` | STRING | ✓ | `h3-video-prompt-director` | Hermes 端要激活的技能名 |
 | `api_url` | STRING | optional | `http://192.168.3.78:8642` | Hermes API base URL |
@@ -297,6 +299,27 @@ print(json.loads(urllib.request.urlopen(req, timeout=30).read())["prompt_id"])
 
 Then poll `/history/<prompt_id>` until `status.completed == True`. Expected
 output: a non-empty `prompt` (typically 5–10 KB of English H3 prompt).
+
+#### Image-only minimal example (no video) / 只输入图的极简示例
+
+The `reference_video` and `video_fps` inputs are optional. A valid
+workflow is just one image + one goal line:
+
+`reference_video` 和 `video_fps` 都是可选的。最简工作流：1 张图 + 1 句话目标：
+
+```python
+workflow = {
+    "1": {"class_type": "LoadImage", "inputs": {"image": "your-image.png"}},
+    "2": {"class_type": "H3PromptDirector", "inputs": {
+        "image_1": ["1", 0],
+        "goal": "让图1的角色站在沙滩上，看向镜头。",
+        "skill_name": "h3-video-prompt-director",
+    }},
+    "3": {"class_type": "SaveText", "inputs": {
+        "text": ["2", 0], "filename_prefix": "h3_prompt", "format": "md",
+    }},
+}
+```
 
 然后轮询 `/history/<prompt_id>`，直到 `status.completed == True`。
 预期输出：一个非空的 `prompt`（通常 5–10 KB 英文 H3 提示词）。

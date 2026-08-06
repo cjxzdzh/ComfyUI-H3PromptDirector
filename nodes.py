@@ -255,11 +255,13 @@ def _compute_cache_key(image_paths, video_path, goal, skill_name,
 
     `api_key` is part of the key — different keys may run against different
     Hermes configurations / users / sessions, so we partition cache by it.
+
+    `video_fps` is only included when a video is provided; otherwise it
+    doesn't affect the output and would create spurious cache misses.
     """
     payload = {
         "image_hashes": [_file_sha256(p) for p in image_paths],
         "video_hash": _file_sha256(video_path) if video_path else "",
-        "video_fps": float(video_fps) if video_fps else DEFAULT_VIDEO_FPS,
         "goal": goal.strip(),
         "skill_name": skill_name,
         "api_url": api_url,
@@ -267,6 +269,8 @@ def _compute_cache_key(image_paths, video_path, goal, skill_name,
         "model": model,
         "output_language": output_language,
     }
+    if video_path:
+        payload["video_fps"] = float(video_fps) if video_fps else DEFAULT_VIDEO_FPS
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -506,14 +510,6 @@ class H3PromptDirector:
         return {
             "required": {
                 "image_1": ("IMAGE",),
-                "reference_video": ("IMAGE",),
-                "video_fps": ("FLOAT", {
-                    "default": DEFAULT_VIDEO_FPS,
-                    "min": 1.0,
-                    "max": 120.0,
-                    "step": 0.5,
-                    "tooltip": "参考视频帧率（FPS），用于把 IMAGE 帧 batch 重新编码成 mp4",
-                }),
                 "goal": ("STRING", {
                     "default": DEFAULT_GOAL,
                     "multiline": True,
@@ -525,6 +521,14 @@ class H3PromptDirector:
                 }),
             },
             "optional": {
+                "reference_video": ("IMAGE",),
+                "video_fps": ("FLOAT", {
+                    "default": DEFAULT_VIDEO_FPS,
+                    "min": 1.0,
+                    "max": 120.0,
+                    "step": 0.5,
+                    "tooltip": "参考视频帧率（FPS），仅当 reference_video 已连接时使用",
+                }),
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
@@ -572,12 +576,15 @@ class H3PromptDirector:
     FUNCTION = "generate"
     CATEGORY = "HermesAI/Prompt"
     DESCRIPTION = ("调用 Hermes API，由 h3-video-prompt-director 技能生成 H3 视频提示词。"
-                   "输入：最多 5 张图 + 1 个视频帧 batch + 视频帧率 + 目标要求。"
+                   "输入：image_1 (必填) + 最多 4 张额外图 + 可选 1 个视频帧 batch + 视频帧率 + 目标要求 + skill 名。"
                    "所有媒体先落盘到 /tmp/h3-prompt-director/<uuid>/ 再传 Hermes。"
-                   "输出：最终提示词（给下游文本编码节点用）。")
+                   "输出：最终提示词（给下游文本编码节点用）。"
+                   "reference_video 是可选的：只输入图 + 一句话目标也能生成 H3 提示词。")
 
-    def generate(self, image_1, reference_video, video_fps, goal,
+    def generate(self, image_1, goal,
                  skill_name=DEFAULT_SKILL_NAME,
+                 reference_video=None,
+                 video_fps=DEFAULT_VIDEO_FPS,
                  image_2=None, image_3=None, image_4=None, image_5=None,
                  api_url=DEFAULT_API_URL, api_key=DEFAULT_API_KEY,
                  model=DEFAULT_MODEL, output_language="english",
@@ -613,9 +620,10 @@ class H3PromptDirector:
                 except Exception as e:
                     print(f"[H3PromptDirector] reference video failed: {e}", flush=True)
 
-            if not image_paths and not video_path:
+            if not image_paths:
                 raise ValueError(
-                    "[H3PromptDirector] 至少需要 1 张图或 1 个参考视频。"
+                    "[H3PromptDirector] image_1 is required; at least one image "
+                    "must connect successfully. (reference_video is optional.)"
                 )
 
             print(f"[H3PromptDirector] {len(image_paths)} image(s), "
