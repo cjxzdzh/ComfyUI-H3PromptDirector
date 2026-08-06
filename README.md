@@ -15,12 +15,12 @@ Hermes API 生成可直接使用的 H3 视频提示词。Hermes 端会自动激�
 ## Features / 功能
 
 - **Up to 5 reference images** (ComfyUI `IMAGE` type) — characters, scenes,
-  styles, key frames, anything.
+  styles, key frames, anything. **All optional** — omit for T2V workflows.
 - **0 or 1 reference video** (ComfyUI `IMAGE` batch — the standard ComfyUI
   convention where video loaders emit a per-frame float tensor). The
   video is **optional** — the node works fine with just an image and a
-  goal. When provided, the node re-encodes the frame batch to a real
-  mp4 on disk so the receiving agent can read it.
+  goal, or with just a goal (T2V). When provided, the node re-encodes
+  the frame batch to a real mp4 on disk so the receiving agent can read it.
 - **Configurable video FPS** — required because the IMAGE batch carries
   no timing metadata. Only used when a video is supplied.
 - **Customizable goal** describing what the user wants in plain Chinese
@@ -36,10 +36,10 @@ Hermes API 生成可直接使用的 H3 视频提示词。Hermes 端会自动激�
 
 ---
 
-- **最多 5 张参考图**（ComfyUI `IMAGE` 类型）—— 人物、场景、风格、关键帧等。
+- **最多 5 张参考图**（ComfyUI `IMAGE` 类型）—— 人物、场景、风格、关键帧等。**全部可选** —— T2V 场景可省略。
 - **0 或 1 段参考视频**（ComfyUI `IMAGE` batch —— ComfyUI 视频加载器输出的标准
   形态：每帧一个 float tensor）。**视频是可选的** —— 只输入图 + 一句话目标
-  也能生成 H3 提示词。提供视频时，节点自动把帧 batch 重编码成 mp4，让
+  也能生成，只用一句话目标也能跑 T2V。提供视频时，节点自动把帧 batch 重编码成 mp4，让
   接收端 agent 直接读。
 - **可配置视频帧率（FPS）** —— IMAGE batch 不带时间元信息，提供视频时填。
 - **可自定义目标** —— 中文 / 英文，自然语言描述。
@@ -73,7 +73,7 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 
 | Slot | Type | Required | Default | Notes |
 |------|------|----------|---------|-------|
-| `image_1` | IMAGE | ✓ | — | 1st reference image (required) |
+| `image_1` | IMAGE | ✓ | — | 1st reference image (omit for T2V workflows) |
 | `image_2` … `image_5` | IMAGE | optional | `None` | additional references |
 | `reference_video` | IMAGE | optional | `None` | the standard per-frame batch from VHS / VRGDG / etc. — optional |
 | `video_fps` | FLOAT | optional | 24.0 | frames per second of the reference video (only used when video is provided) |
@@ -90,7 +90,7 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 
 | 槽 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
-| `image_1` | IMAGE | ✓ | — | 第 1 张参考图（必填） |
+| `image_1` | IMAGE | ✓ | — | 第 1 张参考图（T2V 场景可省略） |
 | `image_2` … `image_5` | IMAGE | optional | `None` | 额外参考图 |
 | `reference_video` | IMAGE | optional | `None` | VHS / VRGDG 等加载器输出的逐帧 batch（可选） |
 | `video_fps` | FLOAT | optional | 24.0 | 参考视频帧率（仅在提供视频时使用） |
@@ -317,6 +317,27 @@ workflow = {
     }},
     "3": {"class_type": "SaveText", "inputs": {
         "text": ["2", 0], "filename_prefix": "h3_prompt", "format": "md",
+    }},
+}
+```
+
+#### T2V (text-only) minimal example / T2V 极简示例 (只输入文字)
+
+You can also run with `goal` only — no image, no video. The node logs
+`T2V mode: no image/video inputs, goal-only workflow` and routes to
+the skill's T2VA mode:
+
+也可以只输入 `goal` —— 不传图、不传视频。节点会打 `T2V mode: no
+image/video inputs, goal-only workflow` 并路由到技能的 T2VA 模式：
+
+```python
+workflow = {
+    "1": {"class_type": "H3PromptDirector", "inputs": {
+        "goal": "夕阳下宁静的沙滩，金色时刻柔和的波浪，无人机缓慢拉远镜头。",
+        "skill_name": "h3-video-prompt-director",
+    }},
+    "2": {"class_type": "SaveText", "inputs": {
+        "text": ["1", 0], "filename_prefix": "h3_t2v_prompt", "format": "md",
     }},
 }
 ```

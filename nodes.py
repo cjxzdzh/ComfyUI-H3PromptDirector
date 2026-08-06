@@ -509,7 +509,6 @@ class H3PromptDirector:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image_1": ("IMAGE",),
                 "goal": ("STRING", {
                     "default": DEFAULT_GOAL,
                     "multiline": True,
@@ -521,6 +520,7 @@ class H3PromptDirector:
                 }),
             },
             "optional": {
+                "image_1": ("IMAGE",),
                 "reference_video": ("IMAGE",),
                 "video_fps": ("FLOAT", {
                     "default": DEFAULT_VIDEO_FPS,
@@ -576,13 +576,15 @@ class H3PromptDirector:
     FUNCTION = "generate"
     CATEGORY = "HermesAI/Prompt"
     DESCRIPTION = ("调用 Hermes API，由 h3-video-prompt-director 技能生成 H3 视频提示词。"
-                   "输入：image_1 (必填) + 最多 4 张额外图 + 可选 1 个视频帧 batch + 视频帧率 + 目标要求 + skill 名。"
+                   "输入：可选 image_1..image_5 + 可选 reference_video + 可选 video_fps + 必填 goal + skill_name。"
+                   "所有输入都是可选的 (除 goal / skill_name) ——"
+                   "仅 goal 一句话也能跑 T2V 文生视频提示词生成。"
                    "所有媒体先落盘到 /tmp/h3-prompt-director/<uuid>/ 再传 Hermes。"
-                   "输出：最终提示词（给下游文本编码节点用）。"
-                   "reference_video 是可选的：只输入图 + 一句话目标也能生成 H3 提示词。")
+                   "输出：最终提示词（给下游文本编码节点用）。")
 
-    def generate(self, image_1, goal,
+    def generate(self, goal,
                  skill_name=DEFAULT_SKILL_NAME,
+                 image_1=None,
                  reference_video=None,
                  video_fps=DEFAULT_VIDEO_FPS,
                  image_2=None, image_3=None, image_4=None, image_5=None,
@@ -620,15 +622,15 @@ class H3PromptDirector:
                 except Exception as e:
                     print(f"[H3PromptDirector] reference video failed: {e}", flush=True)
 
-            if not image_paths:
-                raise ValueError(
-                    "[H3PromptDirector] image_1 is required; at least one image "
-                    "must connect successfully. (reference_video is optional.)"
-                )
-
-            print(f"[H3PromptDirector] {len(image_paths)} image(s), "
-                  f"video={'yes' if video_path else 'no'}, "
-                  f"goal={goal[:60]!r}...", flush=True)
+            # Goal-only T2V is allowed; image_1..5 and reference_video
+            # are all optional. log which mode we're in.
+            if not image_paths and not video_path:
+                print(f"[H3PromptDirector] T2V mode: no image/video inputs, "
+                      f"goal-only workflow", flush=True)
+            else:
+                print(f"[H3PromptDirector] {len(image_paths)} image(s), "
+                      f"video={'yes' if video_path else 'no'}, "
+                      f"goal={goal[:60]!r}...", flush=True)
 
             # ---- 3. Cache check (only when enabled) ----
             cache_key = None
