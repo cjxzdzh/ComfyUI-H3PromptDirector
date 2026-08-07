@@ -57,6 +57,8 @@ DEFAULT_TIMEOUT = 300
 DEFAULT_VIDEO_FPS = 24.0
 MAX_TIMEOUT = 86400  # 24 hours
 DEFAULT_TARGET_DURATION = None  # no target duration by default
+DEFAULT_TARGET_WIDTH = 0  # 0 = "no target width specified"
+DEFAULT_TARGET_HEIGHT = 0  # 0 = "no target height specified"
 
 DEFAULT_ENABLE_CACHE = False
 DEFAULT_CACHE_DIR = "/tmp/h3-prompt-director/cache"
@@ -252,13 +254,12 @@ def _file_sha256(path: str) -> str:
 
 def _compute_cache_key(image_paths, video_path, goal, skill_name,
                        api_url, api_key, model, output_language, video_fps,
-                       target_duration):
+                       target_duration, target_width, target_height):
     """Stable SHA-256 over a canonical JSON of all inputs that affect Hermes output.
 
-    `api_key` is part of the key. `video_fps` is only included when a
-    video is provided; `target_duration` only when no video is provided
-    (the two conditions are mutually exclusive in the prompt-construction
-    logic).
+    `api_key` is part of the key. `video_fps` only when a video is provided;
+    `target_duration` / `target_width` / `target_height` only when no video
+    is provided (the video's own duration / resolution wins if present).
     """
     payload = {
         "image_hashes": [_file_sha256(p) for p in image_paths],
@@ -272,8 +273,12 @@ def _compute_cache_key(image_paths, video_path, goal, skill_name,
     }
     if video_path:
         payload["video_fps"] = float(video_fps) if video_fps else DEFAULT_VIDEO_FPS
-    if not video_path and target_duration is not None:
-        payload["target_duration"] = float(target_duration)
+    if not video_path:
+        if target_duration is not None:
+            payload["target_duration"] = float(target_duration)
+        if target_width > 0 and target_height > 0:
+            payload["target_width"] = int(target_width)
+            payload["target_height"] = int(target_height)
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -345,7 +350,8 @@ def _cache_lru_trim(cache_dir: str):
 def _call_hermes(api_url: str, api_key: str, model: str,
                  image_paths, video_path, goal: str,
                  skill_name: str, timeout: int,
-                 target_duration=None) -> str:
+                 target_duration=None,
+                 target_width=0, target_height=0) -> str:
     """POST a chat completion to Hermes and return the assistant content.
 
     `skill_name` (default: h3-video-prompt-director) tells the receiving
@@ -355,6 +361,10 @@ def _call_hermes(api_url: str, api_key: str, model: str,
     "目标视频时长 {x} 秒" only when NO reference video is provided. When
     a reference video is provided, the duration is implied by the source
     and we skip the hint to avoid contradicting it.
+
+    `target_width` x `target_height` (px, optional ints) are appended as
+    "目标视频分辨率为 AxB" only when both are > 0 and no reference video
+    is provided. Any value <= 0 disables the hint.
     """
     content = []
 
@@ -363,6 +373,10 @@ def _call_hermes(api_url: str, api_key: str, model: str,
         seconds = float(target_duration)
         if seconds > 0:
             intro_lines.append(f"目标视频时长 {seconds:g} 秒。")
+    if not video_path and target_width > 0 and target_height > 0:
+        intro_lines.append(
+            f"目标视频分辨率为 {int(target_width)}x{int(target_height)}。"
+        )
     intro_lines.append("")
     intro_lines.append("素材（请自行读取本地文件）：")
     for i, p in enumerate(image_paths, 1):
@@ -550,7 +564,26 @@ class H3PromptDirector:
                     "max": 600.0,
                     "step": 0.5,
                     "tooltip": "目标视频时长（秒）。仅作为 prompt 提示（拼到 \"目标视频时长 X 秒\"）。"
-                               "只在没有 reference_video 时生效——若已提供参考视频则忽略。",
+                               "只在没有 reference_video 时生效——若已提供参考视频则忽略。"
+                               "<= 0 时忽略。",
+                }),
+                "target_width": ("INT", {
+                    "default": DEFAULT_TARGET_WIDTH,
+                    "min": 0,
+                    "max": 8192,
+                    "step": 8,
+                    "tooltip": "目标视频宽度（像素）。仅作为 prompt 提示（与 target_height 一起拼到 \"目标视频分辨率为 AxB\"）。"
+                               "只在没有 reference_video 时生效——若已提供参考视频则忽略。"
+                               "<= 0 时忽略。",
+                }),
+                "target_height": ("INT", {
+                    "default": DEFAULT_TARGET_HEIGHT,
+                    "min": 0,
+                    "max": 8192,
+                    "step": 8,
+                    "tooltip": "目标视频高度（像素）。仅作为 prompt 提示（与 target_width 一起拼到 \"目标视频分辨率为 AxB\"）。"
+                               "只在没有 reference_video 时生效——若已提供参考视频则忽略。"
+                               "<= 0 时忽略。",
                 }),
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
@@ -599,11 +632,13 @@ class H3PromptDirector:
     FUNCTION = "generate"
     CATEGORY = "HermesAI/Prompt"
     DESCRIPTION = ("调用 Hermes API，由 h3-video-prompt-director 技能生成 H3 视频提示词。"
-                   "输入：可选 image_1..image_5 + 可选 reference_video + 可选 video_fps + 必填 goal + skill_name。"
-                   "所有输入都是可选的 (除 goal / skill_name) ——"
-                   "仅 goal 一句话也能跑 T2V 文生视频提示词生成。"
+                   "输入：goal + skill_name (必填) + 可选 1-5 张图 + 可选 1 个视频帧 batch + 可选视频帧率 + 可选目标时长 / 宽 / 高。"
                    "所有媒体先落盘到 /tmp/h3-prompt-director/<uuid>/ 再传 Hermes。"
-                   "输出：最终提示词（给下游文本编码节点用）。")
+                   "输出：最终提示词（给下游文本编码节点用）。"
+                   "全部媒体可选——支持纯文本 T2V 文生视频提示词生成。"
+                   "target_duration / target_width / target_height 仅在无参考视频时生效。"
+                   "target_duration 拼 \"目标视频时长 X 秒\"；target_width + target_height 一起拼 \"目标视频分辨率为 AxB\"。"
+                   "任何一个值 <= 0 时忽略该提示。")
 
     def generate(self, goal,
                  image_1=None,
@@ -611,6 +646,8 @@ class H3PromptDirector:
                  reference_video=None,
                  video_fps=DEFAULT_VIDEO_FPS,
                  target_duration=DEFAULT_TARGET_DURATION,
+                 target_width=DEFAULT_TARGET_WIDTH,
+                 target_height=DEFAULT_TARGET_HEIGHT,
                  image_2=None, image_3=None, image_4=None, image_5=None,
                  api_url=DEFAULT_API_URL, api_key=DEFAULT_API_KEY,
                  model=DEFAULT_MODEL, output_language="english",
@@ -662,7 +699,7 @@ class H3PromptDirector:
                 cache_key = _compute_cache_key(
                     image_paths, video_path, goal, skill_name,
                     api_url, api_key, model, output_language, video_fps,
-                    target_duration,
+                    target_duration, target_width, target_height,
                 )
                 hit = _cache_get(cache_dir, cache_key)
                 if hit is not None:
@@ -680,6 +717,7 @@ class H3PromptDirector:
                 image_paths=image_paths, video_path=video_path, goal=goal,
                 skill_name=skill_name, timeout=timeout,
                 target_duration=target_duration,
+                target_width=target_width, target_height=target_height,
             )
             prompt = _clean_response(raw, prefer=output_language)
 

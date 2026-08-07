@@ -77,7 +77,9 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 | `image_2` … `image_5` | IMAGE | optional | `None` | additional references |
 | `reference_video` | IMAGE | optional | `None` | the standard per-frame batch from VHS / VRGDG / etc. — optional |
 | `video_fps` | FLOAT | optional | 24.0 | frames per second of the reference video (only used when video is provided) |
-| `target_duration` | FLOAT | optional | `None` | target video length in seconds. Spliced into the prompt as `目标视频时长 X 秒` only when no reference video is provided |
+| `target_duration` | FLOAT | optional | `None` | target video length in seconds. Spliced into the prompt as `目标视频时长 X 秒` only when no reference video is provided. `<= 0` ignores. |
+| `target_width` | INT | optional | 0 | target video width in pixels. Spliced together with `target_height` as `目标视频分辨率为 AxB` only when both > 0 and no reference video is provided |
+| `target_height` | INT | optional | 0 | target video height in pixels. Same rules as `target_width` |
 | `goal` | STRING | ✓ | (Chinese example) | what the user wants |
 | `skill_name` | STRING | ✓ | `h3-video-prompt-director` | the Hermes skill to activate |
 | `api_url` | STRING | optional | `http://192.168.3.78:8642` | Hermes API base URL |
@@ -95,7 +97,9 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 | `image_2` … `image_5` | IMAGE | optional | `None` | 额外参考图 |
 | `reference_video` | IMAGE | optional | `None` | VHS / VRGDG 等加载器输出的逐帧 batch（可选） |
 | `video_fps` | FLOAT | optional | 24.0 | 参考视频帧率（仅在提供视频时使用） |
-| `target_duration` | FLOAT | optional | `None` | 目标视频时长（秒）。仅在无参考视频时拼到 prompt 里 `目标视频时长 X 秒` |
+| `target_duration` | FLOAT | optional | `None` | 目标视频时长（秒）。仅在无参考视频时拼到 prompt 里 `目标视频时长 X 秒`，`<= 0` 时忽略 |
+| `target_width` | INT | optional | 0 | 目标视频宽度（像素）。与 `target_height` 一起拼到 `目标视频分辨率为 AxB`，仅在两者都 > 0 且无参考视频时生效 |
+| `target_height` | INT | optional | 0 | 目标视频高度（像素）。规则同 `target_width` |
 | `goal` | STRING | ✓ | （中文示例） | 用户目标 |
 | `skill_name` | STRING | ✓ | `h3-video-prompt-director` | Hermes 端要激活的技能名 |
 | `api_url` | STRING | optional | `http://192.168.3.78:8642` | Hermes API base URL |
@@ -405,7 +409,7 @@ recent 100 entries.
 > if you want the cache to survive reboots — `/tmp/...` is wiped by the
 > OS on most Linux distributions.
 
-### Target Duration / 目标时长
+### Target Duration / Resolution Hints / 目标时长 / 目标分辨率
 
 When `target_duration` is set (in seconds) and **no** `reference_video`
 is connected, the node appends `目标视频时长 {x} 秒` to the goal so
@@ -413,9 +417,17 @@ Hermes can lock onto the requested length. **When a reference video is
 provided, the duration hint is ignored** — the source video's own
 length wins, and including a contradictory hint would confuse Hermes.
 
+Same logic applies to `target_width` × `target_height`: when both are
+**> 0** and no reference video is provided, the node appends
+`目标视频分辨率为 {W}x{H}`. **Any value <= 0 disables the hint** (default 0).
+Mixing one value > 0 with the other <= 0 also disables the entire hint.
+
 `target_duration` 默认 `None`，连接了 `reference_video` 时不生效。当只
-输入图 + 目标时长时，节点会拼到 `目标视频时长 X 秒`,让 Hermes 锁定
+输入图 + 目标时长时，节点会拼到 `目标视频时长 X 秒`，让 Hermes 锁定
 指定时长。
+
+`target_width` × `target_height` 同样规则：两者都 > 0 且无参考视频时，
+拼 `目标视频分辨率为 AxB`。任一值 <= 0 时，整条提示忽略（默认 0）。
 
 ```python
 # Common workflow: feed a region/preset duration here, e.g. 10s
@@ -426,7 +438,9 @@ workflow = {
         "image_1": ["1", 0],
         "goal": "让图1的角色站在沙滩上,看向镜头。",
         "skill_name": "h3-video-prompt-director",
-        "target_duration": 10.0,  # 区域设置 10 秒
+        "target_duration": 10.0,          # 区域设置 10 秒
+        "target_width": 1280,              # 区域设置宽
+        "target_height": 720,              # 区域设置高
     }},
 }
 ```
