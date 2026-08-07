@@ -77,6 +77,7 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 | `image_2` … `image_5` | IMAGE | optional | `None` | additional references |
 | `reference_video` | IMAGE | optional | `None` | the standard per-frame batch from VHS / VRGDG / etc. — optional |
 | `video_fps` | FLOAT | optional | 24.0 | frames per second of the reference video (only used when video is provided) |
+| `target_duration` | FLOAT | optional | `None` | target video length in seconds. Spliced into the prompt as `目标视频时长 X 秒` only when no reference video is provided |
 | `goal` | STRING | ✓ | (Chinese example) | what the user wants |
 | `skill_name` | STRING | ✓ | `h3-video-prompt-director` | the Hermes skill to activate |
 | `api_url` | STRING | optional | `http://192.168.3.78:8642` | Hermes API base URL |
@@ -94,6 +95,7 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-H3PromptDirector.git
 | `image_2` … `image_5` | IMAGE | optional | `None` | 额外参考图 |
 | `reference_video` | IMAGE | optional | `None` | VHS / VRGDG 等加载器输出的逐帧 batch（可选） |
 | `video_fps` | FLOAT | optional | 24.0 | 参考视频帧率（仅在提供视频时使用） |
+| `target_duration` | FLOAT | optional | `None` | 目标视频时长（秒）。仅在无参考视频时拼到 prompt 里 `目标视频时长 X 秒` |
 | `goal` | STRING | ✓ | （中文示例） | 用户目标 |
 | `skill_name` | STRING | ✓ | `h3-video-prompt-director` | Hermes 端要激活的技能名 |
 | `api_url` | STRING | optional | `http://192.168.3.78:8642` | Hermes API base URL |
@@ -398,10 +400,36 @@ On subsequent runs with byte-identical inputs (and the same `api_url` /
 (`*.json.tmp` + rename) and the directory is LRU-trimmed to the most
 recent 100 entries.
 
-> ⚠️ Defaults to `False`. Set `enable_cache=True` and (optionally) point
+ > ⚠️ Defaults to `False`. Set `enable_cache=True` and (optionally) point
 > `cache_dir` at a persistent location like `~/.cache/h3-prompt-director/`
 > if you want the cache to survive reboots — `/tmp/...` is wiped by the
 > OS on most Linux distributions.
+
+### Target Duration / 目标时长
+
+When `target_duration` is set (in seconds) and **no** `reference_video`
+is connected, the node appends `目标视频时长 {x} 秒` to the goal so
+Hermes can lock onto the requested length. **When a reference video is
+provided, the duration hint is ignored** — the source video's own
+length wins, and including a contradictory hint would confuse Hermes.
+
+`target_duration` 默认 `None`，连接了 `reference_video` 时不生效。当只
+输入图 + 目标时长时，节点会拼到 `目标视频时长 X 秒`,让 Hermes 锁定
+指定时长。
+
+```python
+# Common workflow: feed a region/preset duration here, e.g. 10s
+# 常见用法:把工作流里"区域设置 10 秒"的输入接上
+workflow = {
+    "1": {"class_type": "LoadImage", "inputs": {"image": "your-image.png"}},
+    "2": {"class_type": "H3PromptDirector", "inputs": {
+        "image_1": ["1", 0],
+        "goal": "让图1的角色站在沙滩上,看向镜头。",
+        "skill_name": "h3-video-prompt-director",
+        "target_duration": 10.0,  # 区域设置 10 秒
+    }},
+}
+```
 
 打开 `enable_cache` 后，节点会用 SHA-256 缓存函数返回 prompt 和 raw。
 缓存键覆盖所有影响结果的输入：每张图片、整个视频文件、fps、goal、

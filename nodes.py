@@ -56,6 +56,7 @@ DEFAULT_GOAL = "让图1的角色模仿参考视频的角色跳舞，保留图1�
 DEFAULT_TIMEOUT = 300
 DEFAULT_VIDEO_FPS = 24.0
 MAX_TIMEOUT = 86400  # 24 hours
+DEFAULT_TARGET_DURATION = None  # no target duration by default
 
 DEFAULT_ENABLE_CACHE = False
 DEFAULT_CACHE_DIR = "/tmp/h3-prompt-director/cache"
@@ -250,14 +251,14 @@ def _file_sha256(path: str) -> str:
 
 
 def _compute_cache_key(image_paths, video_path, goal, skill_name,
-                       api_url, api_key, model, output_language, video_fps):
+                       api_url, api_key, model, output_language, video_fps,
+                       target_duration):
     """Stable SHA-256 over a canonical JSON of all inputs that affect Hermes output.
 
-    `api_key` is part of the key — different keys may run against different
-    Hermes configurations / users / sessions, so we partition cache by it.
-
-    `video_fps` is only included when a video is provided; otherwise it
-    doesn't affect the output and would create spurious cache misses.
+    `api_key` is part of the key. `video_fps` is only included when a
+    video is provided; `target_duration` only when no video is provided
+    (the two conditions are mutually exclusive in the prompt-construction
+    logic).
     """
     payload = {
         "image_hashes": [_file_sha256(p) for p in image_paths],
@@ -271,6 +272,8 @@ def _compute_cache_key(image_paths, video_path, goal, skill_name,
     }
     if video_path:
         payload["video_fps"] = float(video_fps) if video_fps else DEFAULT_VIDEO_FPS
+    if not video_path and target_duration is not None:
+        payload["target_duration"] = float(target_duration)
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -341,15 +344,27 @@ def _cache_lru_trim(cache_dir: str):
 
 def _call_hermes(api_url: str, api_key: str, model: str,
                  image_paths, video_path, goal: str,
-                 skill_name: str, timeout: int) -> str:
+                 skill_name: str, timeout: int,
+                 target_duration=None) -> str:
     """POST a chat completion to Hermes and return the assistant content.
 
     `skill_name` (default: h3-video-prompt-director) tells the receiving
     Hermes agent which skill to activate for the response.
+
+    `target_duration` (seconds, optional) is appended to the goal as
+    "目标视频时长 {x} 秒" only when NO reference video is provided. When
+    a reference video is provided, the duration is implied by the source
+    and we skip the hint to avoid contradicting it.
     """
     content = []
 
-    intro_lines = [goal.strip(), "", "素材（请自行读取本地文件）："]
+    intro_lines = [goal.strip()]
+    if target_duration is not None and not video_path:
+        seconds = float(target_duration)
+        if seconds > 0:
+            intro_lines.append(f"目标视频时长 {seconds:g} 秒。")
+    intro_lines.append("")
+    intro_lines.append("素材（请自行读取本地文件）：")
     for i, p in enumerate(image_paths, 1):
         intro_lines.append(f"- 图{i}: {p}")
     if video_path:
@@ -529,6 +544,14 @@ class H3PromptDirector:
                     "step": 0.5,
                     "tooltip": "参考视频帧率（FPS），仅当 reference_video 已连接时使用",
                 }),
+                "target_duration": ("FLOAT", {
+                    "default": DEFAULT_TARGET_DURATION,
+                    "min": 0.0,
+                    "max": 600.0,
+                    "step": 0.5,
+                    "tooltip": "目标视频时长（秒）。仅作为 prompt 提示（拼到 \"目标视频时长 X 秒\"）。"
+                               "只在没有 reference_video 时生效——若已提供参考视频则忽略。",
+                }),
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
@@ -583,10 +606,11 @@ class H3PromptDirector:
                    "输出：最终提示词（给下游文本编码节点用）。")
 
     def generate(self, goal,
-                 skill_name=DEFAULT_SKILL_NAME,
                  image_1=None,
+                 skill_name=DEFAULT_SKILL_NAME,
                  reference_video=None,
                  video_fps=DEFAULT_VIDEO_FPS,
+                 target_duration=DEFAULT_TARGET_DURATION,
                  image_2=None, image_3=None, image_4=None, image_5=None,
                  api_url=DEFAULT_API_URL, api_key=DEFAULT_API_KEY,
                  model=DEFAULT_MODEL, output_language="english",
@@ -638,6 +662,7 @@ class H3PromptDirector:
                 cache_key = _compute_cache_key(
                     image_paths, video_path, goal, skill_name,
                     api_url, api_key, model, output_language, video_fps,
+                    target_duration,
                 )
                 hit = _cache_get(cache_dir, cache_key)
                 if hit is not None:
@@ -654,6 +679,7 @@ class H3PromptDirector:
                 api_url=api_url, api_key=api_key, model=model,
                 image_paths=image_paths, video_path=video_path, goal=goal,
                 skill_name=skill_name, timeout=timeout,
+                target_duration=target_duration,
             )
             prompt = _clean_response(raw, prefer=output_language)
 
