@@ -455,12 +455,86 @@ def _call_hermes(api_url: str, api_key: str, model: str,
 # ---------------------------------------------------------------------------
 
 
+_FENCE_RE = re.compile(r"```(?:[A-Za-z0-9_+\-]*)?\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _all_fences(text: str) -> list:
+    """Return all fenced code block bodies in document order, deduped empty."""
+    if not text:
+        return []
+    return [m.group(1).strip() for m in _FENCE_RE.finditer(text) if m.group(1).strip()]
+
+
+def _slice_block(text: str, heading_regex: str) -> str | None:
+    """Find the body of the FIRST fenced code block that follows a heading line.
+
+    Returns None when no heading line is found.
+    """
+    h_re = re.compile(heading_regex + r"[^\n]*\n+", re.MULTILINE)
+    m = h_re.search(text)
+    if not m:
+        return None
+    rest = text[m.end():]
+    cb = re.search(r"```(?:[A-Za-z0-9_+\-]*)?\s*\n(.*?)\n```",
+                   rest, re.DOTALL)
+    if cb:
+        return cb.group(1).strip()
+    next_h = re.search(r"\n(?:模型选择|任务模式|提示词格式|选择理由|素材角色表|最终提示词|建议设置|审查)", rest)
+    end = next_h.start() if next_h else len(rest)
+    return rest[:end].strip()
+
+
+def _detect_lang_by_script(block: str) -> str:
+    """Return 'cn' or 'en' by counting CJK vs latin characters.
+
+    The first H3-prompt-director code block is the English H3-executable;
+    the second is the Chinese mirror. When Hermes skips the heading line,
+    this fallback classifier keeps the selection stable.
+    """
+    cjk = sum(1 for ch in block if "\u4e00" <= ch <= "\u9fff" or
+                                   "\u3000" <= ch <= "\u303f" or
+                                   "\uff00" <= ch <= "\uffef")
+    return "cn" if cjk > 0 else "en"
+
+
+def _classify_fences(fences: list) -> tuple:
+    """Split raw fences into (en_block, cn_block) by script heuristic.
+
+    Fences appear in document order. The first English-classified fence is
+    `en`; the first Chinese-classified fence is `cn`. Extra fences (e.g.
+    thought-leak) are ignored.
+    """
+    en = None
+    cn = None
+    for f in fences:
+        lang = _detect_lang_by_script(f)
+        if lang == "en" and en is None:
+            en = f
+        elif lang == "cn" and cn is None:
+            cn = f
+        if en is not None and cn is not None:
+            break
+    return en, cn
+
+
 def _clean_response(text: str, prefer: str = "english") -> str:
     """Strip whatever prose the model added; keep only the final prompt.
 
-    The h3-video-prompt-director skill always returns two code blocks:
+    The h3-video-prompt-director skill usually returns two code blocks:
       - "最终提示词（英文版）" — the ComfyUI / local H3-Base executable
       - "最终提示词（中文对照版）" — for human review only
+
+    Selection logic / 选择逻辑:
+      1. If Hermes emits the "最终提示词（英文版）" / "中文对照版" heading,
+         we extract by heading. This is the precise path.
+      2. If Hermes skipped the heading (vLLM truncation or v2 skill format
+         change), we fall back to fence-index + CJK-script classifier
+         on ALL fences. English = first latin fence, Chinese = first CJK
+         fence. The previous behaviour returned the largest fence, which
+         on a chinese-prefer request would still return English when
+         both languages were emitted as bare code blocks — fixed here.
+      3. As a last resort, we strip "建议设置" / "审查" tails and return
+         the remaining text.
 
     `prefer` selects which one to return:
       - "english" (default) — the English version
@@ -470,22 +544,15 @@ def _clean_response(text: str, prefer: str = "english") -> str:
     if not text:
         return ""
 
-    def _slice_block(heading_regex: str):
-        h_re = re.compile(heading_regex + r"[^\n]*\n+", re.MULTILINE)
-        m = h_re.search(text)
-        if not m:
-            return None
-        rest = text[m.end():]
-        cb = re.search(r"```(?:[A-Za-z0-9_+\-]*)?\s*\n(.*?)\n```",
-                       rest, re.DOTALL)
-        if cb:
-            return cb.group(1).strip()
-        next_h = re.search(r"\n(?:模型选择|任务模式|提示词格式|选择理由|素材角色表|最终提示词|建议设置|审查)", rest)
-        end = next_h.start() if next_h else len(rest)
-        return rest[:end].strip()
+    en = _slice_block(text, r"最终提示词[（(]英文版[）)]")
+    cn = _slice_block(text, r"最终提示词[（(]中文(?:对照版|版)[）)]")
 
-    en = _slice_block(r"最终提示词[（(]英文版[）)]")
-    cn = _slice_block(r"最终提示词[（(]中文(?:对照版|版)[）)]")
+    # If either heading is missing, use fence-index fallback.
+    if en is None or cn is None:
+        all_fences = _all_fences(text)
+        en_fb, cn_fb = _classify_fences(all_fences)
+        en = en if en is not None else en_fb
+        cn = cn if cn is not None else cn_fb
 
     if prefer == "english":
         if en:
@@ -507,11 +574,10 @@ def _clean_response(text: str, prefer: str = "english") -> str:
         if cn:
             return cn
 
-    # Fallback: largest code block in the response.
-    fences = re.findall(r"```(?:[A-Za-z0-9_+\-]*)?\n(.*?)\n```",
-                        text, re.DOTALL)
+    # Last-resort: largest fence, then strip "建议设置" / "审查" tails.
+    fences = _all_fences(text)
     if fences:
-        body = max(fences, key=len).strip()
+        body = max(fences, key=len)
         for stop in ("\n建议设置", "\n审查", "\n4. ", "\n- 时长:"):
             idx = body.find(stop)
             if idx > 0:

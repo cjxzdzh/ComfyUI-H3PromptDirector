@@ -460,35 +460,76 @@ def _call_hermes_segment(
 # ---------------------------------------------------------------------------
 
 
+_SEG_FENCE_RE = re.compile(r"```(?:[A-Za-z0-9_+\-]*)?\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _all_fences_seg(text: str) -> list:
+    if not text:
+        return []
+    return [m.group(1).strip() for m in _SEG_FENCE_RE.finditer(text) if m.group(1).strip()]
+
+
+def _slice_block_seg(text: str, heading_regex: str) -> str | None:
+    h_re = re.compile(heading_regex + r"[^\n]*\n+", re.MULTILINE)
+    m = h_re.search(text)
+    if not m:
+        return None
+    rest = text[m.end():]
+    cb = re.search(r"```(?:[A-Za-z0-9_+\-]*)?\s*\n(.*?)\n```",
+                   rest, re.DOTALL)
+    if cb:
+        return cb.group(1).strip()
+    next_h = re.search(
+        r"\n(?:模型选择|任务模式|提示词格式|选择理由|素材角色表|最终提示词|建议设置|审查)",
+        rest,
+    )
+    end = next_h.start() if next_h else len(rest)
+    return rest[:end].strip()
+
+
+def _detect_lang_by_script_seg(block: str) -> str:
+    cjk = sum(1 for ch in block if "\u4e00" <= ch <= "\u9fff" or
+                                   "\u3000" <= ch <= "\u303f" or
+                                   "\uff00" <= ch <= "\uffef")
+    return "cn" if cjk > 0 else "en"
+
+
+def _classify_fences_seg(fences: list) -> tuple:
+    en = None
+    cn = None
+    for f in fences:
+        lang = _detect_lang_by_script_seg(f)
+        if lang == "en" and en is None:
+            en = f
+        elif lang == "cn" and cn is None:
+            cn = f
+        if en is not None and cn is not None:
+            break
+    return en, cn
+
+
 def _clean_response(text: str, prefer: str = "english") -> str:
     """Strip whatever prose the model added; keep only the final prompt.
 
     The h3-video-segment-prompt-director skill returns the same shape as
     h3-video-prompt-director: two code blocks, "最终提示词（英文版）" and
     "最终提示词（中文对照版）".
+
+    When Hermes omits the heading line (vLLM truncation or skill format
+    change), we fall back to fence-index + CJK-script classifier on all
+    fences. English = first latin fence, Chinese = first CJK fence.
     """
     if not text:
         return ""
 
-    def _slice_block(heading_regex: str):
-        h_re = re.compile(heading_regex + r"[^\n]*\n+", re.MULTILINE)
-        m = h_re.search(text)
-        if not m:
-            return None
-        rest = text[m.end():]
-        cb = re.search(r"```(?:[A-Za-z0-9_+\-]*)?\s*\n(.*?)\n```",
-                       rest, re.DOTALL)
-        if cb:
-            return cb.group(1).strip()
-        next_h = re.search(
-            r"\n(?:模型选择|任务模式|提示词格式|选择理由|素材角色表|最终提示词|建议设置|审查)",
-            rest,
-        )
-        end = next_h.start() if next_h else len(rest)
-        return rest[:end].strip()
+    en = _slice_block_seg(text, r"最终提示词[（(]英文版[）)]")
+    cn = _slice_block_seg(text, r"最终提示词[（(]中文(?:对照版|版)[）)]")
 
-    en = _slice_block(r"最终提示词[（(]英文版[）)]")
-    cn = _slice_block(r"最终提示词[（(]中文(?:对照版|版)[）)]")
+    if en is None or cn is None:
+        all_fences = _all_fences_seg(text)
+        en_fb, cn_fb = _classify_fences_seg(all_fences)
+        en = en if en is not None else en_fb
+        cn = cn if cn is not None else cn_fb
 
     if prefer == "english":
         if en:
@@ -510,11 +551,47 @@ def _clean_response(text: str, prefer: str = "english") -> str:
         if cn:
             return cn
 
-    # Fallback: largest code block
-    fences = re.findall(r"```(?:[A-Za-z0-9_+\-]*)?\n(.*?)\n```", text, re.DOTALL)
+    # Last-resort fallback: largest fence.
+    fences = _all_fences_seg(text)
     if fences:
-        return max(fences, key=len).strip()
+        return max(fences, key=len)
     return text.strip()
+
+
+def _append_starting_frame_lock(prompt: str, seg_index: int, image_5_path: "str | None") -> str:
+    """For segment i >= 2, append a <image_reference_6> block describing the
+    starting-frame lock so H3 honors the previous segment's last frame.
+
+    The new image reference index is 6 (one slot above image_5) by convention
+    — it tells H3 to treat this image as a *new* reference for the
+    starting frame, separate from the user-provided image_1..4.
+
+    Why 6 not "5+1 of last image ref" / 为什么是 6 不是 5+1:
+    - The user's image_5 is the convention for "previous segment's last
+      frame". We always expose it to the skill under that name; the
+      downstream H3 invocation chain reads it as image_5.
+    - In the *cleaned prompt* we surface the constraint as image_reference_6
+      so it appears as a new labelled reference in the final H3 prompt,
+      matching the user's "appended <image_reference_X+1>" rule where
+      X = the slot of the boundary lock (image_5) and X+1 = 6.
+    """
+    if seg_index < 2 or not image_5_path:
+        return prompt
+    lock_block = (
+        "\n\n[<image_reference_6>]\n"
+        "This is the STARTING-FRAME LOCK image for this segment. The previous "
+        "segment's last frame is captured at:\n"
+        f"  {image_5_path}\n"
+        "The H3 video generation MUST use this image as the literal first "
+        "frame. Preserve every visible element of the source frame — "
+        "character pose, expression, gaze direction, lighting, color grade, "
+        "and background layout — so the transition from the previous "
+        "segment is visually seamless. The motion for this segment then "
+        "continues from this locked starting frame, following the segment's "
+        "reference video choreography."
+    )
+    # Strip a trailing newline so we don't double up.
+    return prompt.rstrip("\n") + lock_block
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +841,12 @@ class H3SegmentPromptDirector:
                     video_fps=video_fps,
                 )
                 cleaned = _clean_response(raw, prefer=output_language)
+                # Append <image_reference_6> starting-frame lock to
+                # segment i >= 2 so the H3 prompt explicitly references
+                # the boundary lock image.
+                cleaned = _append_starting_frame_lock(
+                    cleaned, seg_index, image_5_path,
+                )
 
                 if enable_cache and cache_key:
                     _cache_put(cache_dir, cache_key, cleaned, raw)
