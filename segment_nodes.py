@@ -558,27 +558,24 @@ def _clean_response(text: str, prefer: str = "english") -> str:
     return text.strip()
 
 
-def _append_starting_frame_lock(prompt: str, seg_index: int, image_5_path: "str | None") -> str:
-    """For segment i >= 2, append a <image_reference_6> block describing the
-    starting-frame lock so H3 honors the previous segment's last frame.
+def _append_starting_frame_lock(
+    prompt: str, seg_index: int, image_5_path: "str | None",
+    boundary_lock_index: int,
+) -> str:
+    """For segment i >= 2, append a <image_reference_N+1> block describing
+    the starting-frame lock so H3 honors the previous segment's last frame.
 
-    The new image reference index is 6 (one slot above image_5) by convention
-    — it tells H3 to treat this image as a *new* reference for the
-    starting frame, separate from the user-provided image_1..4.
-
-    Why 6 not "5+1 of last image ref" / 为什么是 6 不是 5+1:
-    - The user's image_5 is the convention for "previous segment's last
-      frame". We always expose it to the skill under that name; the
-      downstream H3 invocation chain reads it as image_5.
-    - In the *cleaned prompt* we surface the constraint as image_reference_6
-      so it appears as a new labelled reference in the final H3 prompt,
-      matching the user's "appended <image_reference_X+1>" rule where
-      X = the slot of the boundary lock (image_5) and X+1 = 6.
+    `boundary_lock_index` is the image reference slot reserved for the
+    boundary lock. With the user's image_1..image_4 plus a separate
+    image_5 boundary lock input, the slot is fixed at 5. If the user
+    reorders / drops user images, we still want X = len(user_images) + 1
+    (one slot above the last user-provided image), which is what callers
+    pass in.
     """
     if seg_index < 2 or not image_5_path:
         return prompt
     lock_block = (
-        "\n\n[<image_reference_6>]\n"
+        f"\n\n[<image_reference_{boundary_lock_index}>]\n"
         "This is the STARTING-FRAME LOCK image for this segment. The previous "
         "segment's last frame is captured at:\n"
         f"  {image_5_path}\n"
@@ -841,11 +838,17 @@ class H3SegmentPromptDirector:
                     video_fps=video_fps,
                 )
                 cleaned = _clean_response(raw, prefer=output_language)
-                # Append <image_reference_6> starting-frame lock to
+                # Append <image_reference_(N+1)> starting-frame lock to
                 # segment i >= 2 so the H3 prompt explicitly references
-                # the boundary lock image.
+                # the boundary lock image. N+1 = len(user_images) + 1.
+                # (The boundary lock itself is exposed to Hermes as
+                # image_5; the cleaned prompt surfaces it as a fresh
+                # numbered reference so the H3 chain downstream reads
+                # it as the next available slot.)
+                boundary_lock_index = len(image_paths) + 1
                 cleaned = _append_starting_frame_lock(
                     cleaned, seg_index, image_5_path,
+                    boundary_lock_index=boundary_lock_index,
                 )
 
                 if enable_cache and cache_key:
