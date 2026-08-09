@@ -358,10 +358,11 @@ workflow = {
 ```
 ComfyUI-H3PromptDirector/
 ├── __init__.py                      ← ComfyUI registration entry
-├── nodes.py                          ← the node itself
+├── nodes.py                          ← H3PromptDirector (single-segment node)
+├── segment_nodes.py                  ← H3SegmentPromptDirector (multi-segment node)
 ├── README.md                         ← this file (中英双语)
 ├── LICENSE                           ← MIT
-├── h3-video-prompt-director-skill/   ← bundled Hermes skill (NOT authored by us)
+├── h3-video-prompt-director-skill/   ← bundled single-segment Hermes skill
 │   ├── SKILL.md
 │   ├── agents/
 │   │   └── openai.yaml
@@ -371,6 +372,11 @@ ComfyUI-H3PromptDirector/
 │       ├── prompt-patterns.md
 │       ├── ref-context-ir.md
 │       └── webapp-natural-language.md
+├── h3-video-segment-prompt-director-skill/   ← bundled segment-aware Hermes skill
+│   ├── SKILL.md
+│   ├── agents/
+│   │   └── openai.yaml
+│   └── references/                  ← same references as the single-segment skill
 └── .gitignore
 ```
 
@@ -454,6 +460,111 @@ skill_name、api_url、api_key、model、output_language。下次相同输入
 > ⚠️ 默认 `False`。如需跨重启保留，**设置 `cache_dir` 为持久路径**
 > （如 `~/.cache/h3-prompt-director/`），因为默认 `/tmp/...` 会被
 > 系统清理。
+
+---
+
+## H3SegmentPromptDirector — Multi-Segment Generation / 多段视频生成
+
+When the source reference video is too long for a single H3 call
+(H3's per-call length cap is ≈ 10–15 seconds, and drops further with
+heavy references or large resolution), you can split the source into
+N clips ahead of time and run each clip through H3 separately, then
+stitch the outputs. This node generates **one prompt per clip**.
+
+当参考视频比单次 H3 调用上限（≈ 10–15 秒，且加重参考或大分辨率还会更短）
+还长时，可以先把视频切成 N 段，每段单独跑 H3，再拼接结果。本节点为
+**每段分别生成一份 prompt**。
+
+### When to use / 何时使用
+
+| Scenario | Use |
+|---|---|
+| Reference video ≤ 15s and your scene fits H3 cap | `H3PromptDirector` (single) |
+| Reference video > 15s, you need N sequential generations | `H3SegmentPromptDirector` (this node) |
+
+| 场景 | 用哪个 |
+|---|---|
+| 参考视频 ≤ 15 秒且场景能装进 H3 上限 | `H3PromptDirector`（单段） |
+| 参考视频 > 15 秒，需顺序生成 N 段 | `H3SegmentPromptDirector`（本节点） |
+
+### Inputs / 输入
+
+| Slot | Type | Required | Default | Notes |
+|------|------|----------|---------|-------|
+| `reference_video_1` | IMAGE | ✓ | — | segment 1's video frames |
+| `reference_video_2..12` | IMAGE | optional | `None` | subsequent segments; first None terminates the list |
+| `segment_duration` | FLOAT | ✓ | 10.0 | target length per segment in seconds |
+| `goal` | STRING | ✓ | Chinese example | overall goal |
+| `skill_name` | STRING | ✓ | `h3-video-segment-prompt-director` | the Hermes skill to activate |
+| `image_1..image_4` | IMAGE | optional | `None` | character / scene / style references (same as single-segment node) |
+| `image_5` | IMAGE | optional | `None` | **boundary lock image** for segments ≥ 2 (typically the previous segment's last frame) |
+| `video_fps` | FLOAT | optional | 24.0 | frame rate of each segment's video |
+| `api_url` / `api_key` / `model` / `output_language` / `keep_temp_files` / `enable_cache` / `cache_dir` / `timeout` | — | optional | sensible defaults | same as `H3PromptDirector` |
+
+### Outputs / 输出
+
+| Slot | Type | Notes |
+|------|------|-------|
+| `prompt_1..prompt_12` | STRING | one final H3 prompt per segment. Unused slots are empty strings. Wire each into the corresponding downstream H3 invocation. |
+| `raw` | STRING | concatenated raw Hermes responses for all segments, separated by `===== SEGMENT N =====` markers (debugging) |
+| `temp_dir` | STRING | absolute path of the working directory; empty string after cleanup |
+
+### How it differs from `H3PromptDirector` / 与 H3PromptDirector 的区别
+
+- **Multiple video inputs** (up to 12 clips) instead of one.
+- **Per-segment Hermes call**: each clip gets its own prompt. Hermes
+  is told `第 i 段 / 共 N 段` and `目标时长 {duration} 秒` for each call.
+- **Boundary lock on segment i ≥ 2**: if `image_5` is provided, the
+  skill must describe it as the starting-frame lock so H3 honors
+  the transition from segment i-1's last frame.
+- **No combined prompt output**: each segment's prompt goes into its
+  own `prompt_N` slot because downstream H3 invocations need separate
+  prompts.
+
+### Workflow example / 工作流示例
+
+For a 30s reference video split into three 10s clips, with a
+character image and the previous segment's last frame as boundary
+lock:
+
+把 30 秒参考视频切成三段 10 秒，输入角色图，segment 2/3 各用前一段
+最后一帧作为起始帧锁定：
+
+```python
+workflow = {
+    "1": {"class_type": "VHS_LoadVideoPath",
+           "inputs": {"video": "/abs/segment_1.mp4", "force_rate": 30}},
+    "2": {"class_type": "VHS_LoadVideoPath",
+           "inputs": {"video": "/abs/segment_2.mp4", "force_rate": 30}},
+    "3": {"class_type": "VHS_LoadVideoPath",
+           "inputs": {"video": "/abs/segment_3.mp4", "force_rate": 30}},
+    "4": {"class_type": "LoadImage",
+           "inputs": {"image": "character.png"}},                # role image_1
+    "5": {"class_type": "H3SegmentPromptDirector", "inputs": {
+        "reference_video_1": ["1", 0],
+        "reference_video_2": ["2", 0],
+        "reference_video_3": ["3", 0],
+        "segment_duration": 10.0,
+        "image_1": ["4", 0],
+        "goal": "将图1的角色迁移到参考视频里，保持动作一致。",
+        "skill_name": "h3-video-segment-prompt-director",
+    }},
+    # Wire 5.prompt_1 -> your H3-text-encode -> H3 generation for segment 1
+    # After segment 1's H3 outputs, extract its last frame and pass it
+    # as image_5 (via your external frame-fetch node) into a second
+    # invocation that re-runs this node for segment 2.
+}
+```
+
+> 💡 The node does NOT auto-fetch the previous segment's last frame.
+> You do that with another ComfyUI node (e.g. VHS frame-slice) and
+> re-run this node — or run all N segments in one call (the simpler
+> path for ≤ 4 segments). The skill handles the boundary lock; the
+> node just ships the prompt.
+
+> 💡 本节点**不会自动抓上一段最后一帧**。需要另一个 ComfyUI 节点
+> （如 VHS 帧切片）来抓，然后重跑本节点；或者在一次调用里跑完所有 N 段
+> （≤ 4 段推荐）。Skill 处理边界锁定；本节点只负责发 prompt。
 
 ---
 
