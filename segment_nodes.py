@@ -354,18 +354,20 @@ def _cache_lru_trim(cache_dir):
 
 def _call_hermes_segment(
     api_url, api_key, model,
-    image_paths, image_5_path,
+    image_paths,
     video_path, segment_index, segment_count,
     segment_duration, goal, skill_name, timeout,
     video_fps=DEFAULT_VIDEO_FPS,
 ):
     """POST a chat completion for ONE segment and return the assistant content.
 
-    For segment_index == 1: image_5_path is ignored; image_paths contain
-    the user's normal references (image_1..image_4).
-
-    For segment_index >= 2: image_5_path is the previous segment's last
-    frame; we splice it into the prompt as the starting-frame lock.
+    All segments (1..N) receive the same Hermes input: `image_paths`
+    (image_1..image_4) + the segment's own video file. The boundary
+    lock (image_5 in the workflow) is NOT sent to Hermes — it is a
+    node-local metadata only. The node manually appends a
+    `<image_reference_(N+1)>` block to the cleaned prompt for segments
+    i >= 2, so the boundary lock never pollutes the agent's media
+    list and the agent always sees the same image set as segment 1.
     """
     content = []
 
@@ -375,20 +377,11 @@ def _call_hermes_segment(
         f"切分信息：第 {segment_index} 段 / 共 {segment_count} 段，"
         f"目标时长 {segment_duration:g} 秒。"
     )
-
-    if segment_index >= 2 and image_5_path:
-        intro_lines.append(
-            "本段为续作段，必须把起始帧锁定图（见下 image_5）作为本段首帧，"
-            "并在本段动作描述的最前面先描述这张起始帧，"
-            "保证与上一段的最后一帧无缝衔接。"
-        )
     intro_lines.append("")
     intro_lines.append("素材（请自行读取本地文件）：")
 
     for i, p in enumerate(image_paths, 1):
         intro_lines.append(f"- 图{i}: {p}")
-    if segment_index >= 2 and image_5_path:
-        intro_lines.append(f"- 图5 (起始帧锁定): {image_5_path}")
     if video_path:
         try:
             probe = subprocess.run(
@@ -411,11 +404,10 @@ def _call_hermes_segment(
     )
     content.append({"type": "text", "text": "\n".join(intro_lines)})
 
-    # Embed all images
-    all_paths = list(image_paths)
-    if segment_index >= 2 and image_5_path:
-        all_paths.append(image_5_path)
-    for p in all_paths:
+    # Embed all user images (image_1..image_4). image_5 (boundary
+    # lock) is NOT sent to Hermes — the node handles the lock
+    # locally after _clean_response via _append_starting_frame_lock.
+    for p in image_paths:
         try:
             with open(p, "rb") as f:
                 data = f.read()
@@ -559,37 +551,46 @@ def _clean_response(text: str, prefer: str = "english") -> str:
 
 
 def _append_starting_frame_lock(
-    prompt: str, seg_index: int, image_5_path: "str | None",
-    boundary_lock_index: int,
-) -> str:
+    prompt, seg_index, image_5_path, boundary_lock_index,
+):
     """For segment i >= 2, append a <image_reference_N+1> block describing
     the starting-frame lock so H3 honors the previous segment's last frame.
 
     `boundary_lock_index` is the image reference slot reserved for the
-    boundary lock. With the user's image_1..image_4 plus a separate
-    image_5 boundary lock input, the slot is fixed at 5. If the user
-    reorders / drops user images, we still want X = len(user_images) + 1
-    (one slot above the last user-provided image), which is what callers
-    pass in.
+    boundary lock (= len(user_images) + 1).
 
-    Skip when:
-      - seg_index < 2 (segment 1 has no previous frame to lock on)
-      - image_5_path is None (no boundary lock supplied)
-      - prompt is empty or very short (< 50 chars) — the underlying
-        Hermes call returned garbage (e.g. "saved to /tmp, now output"
-        meta-prose). Appending the lock block to such garbage would
-        produce a meaningless prompt_2; the user has to debug the
-        upstream call instead.
+    Behavior / 行为:
+      - ALWAYS append for seg_index >= 2 (regardless of whether the
+        user wired image_5). The lock description is a node-local
+        metadata block on the cleaned prompt — Hermes never sees it.
+      - When image_5 is connected, its path is embedded verbatim so
+        the downstream H3 invocation can read it.
+      - When image_5 is NOT connected, a placeholder path is used;
+        the user must wire the previous segment's last frame into
+        image_5 for H3 to actually pick it up.
+      - Skip when the cleaned prompt is empty / very short (< 50
+        chars): the underlying Hermes call returned garbage and
+        appending a lock block would produce a meaningless prompt_2.
     """
-    if seg_index < 2 or not image_5_path:
+    if seg_index < 2:
         return prompt
     if not prompt or len(prompt.strip()) < 50:
         return prompt
+    if image_5_path:
+        path_line = f"  {image_5_path}"
+        lock_note = ("The previous segment's last frame is captured at the "
+                     "path above.")
+    else:
+        path_line = ("  [image_5 not connected — wire the previous segment's "
+                     "last frame into this node's image_5 input]")
+        lock_note = ("No image_5 was supplied to this node, so this lock is a "
+                     "placeholder. Wire the previous segment's last frame "
+                     "into the image_5 input so H3 can pick it up.")
     lock_block = (
         f"\n\n[<image_reference_{boundary_lock_index}>]\n"
-        "This is the STARTING-FRAME LOCK image for this segment. The previous "
-        "segment's last frame is captured at:\n"
-        f"  {image_5_path}\n"
+        "This is the STARTING-FRAME LOCK image for this segment.\n"
+        f"{lock_note}\n"
+        f"{path_line}\n"
         "The H3 video generation MUST use this image as the literal first "
         "frame. Preserve every visible element of the source frame — "
         "character pose, expression, gaze direction, lighting, color grade, "
@@ -598,7 +599,6 @@ def _append_starting_frame_lock(
         "continues from this locked starting frame, following the segment's "
         "reference video choreography."
     )
-    # Strip a trailing newline so we don't double up.
     return prompt.rstrip("\n") + lock_block
 
 
@@ -832,16 +832,12 @@ class H3SegmentPromptDirector:
                     print(f"[H3SegmentPromptDirector] segment {seg_index} "
                           f"cache MISS", flush=True)
 
-                # Build the per-segment image set:
-                #   segment 1: image_1..image_4
-                #   segment i >= 2: image_1..image_4 + image_5 (boundary lock)
-                seg_images = list(image_paths)
-                if seg_index >= 2 and image_5_path:
-                    seg_images.append(image_5_path)
-
+                # All segments (1..N) get the same image set sent to
+                # Hermes. image_5 is node-local and never reaches
+                # the agent.
                 raw = _call_hermes_segment(
                     api_url=api_url, api_key=api_key, model=model,
-                    image_paths=seg_images, image_5_path=image_5_path,
+                    image_paths=image_paths,
                     video_path=video_paths[i],
                     segment_index=seg_index, segment_count=segment_count,
                     segment_duration=segment_duration, goal=goal,
@@ -850,12 +846,10 @@ class H3SegmentPromptDirector:
                 )
                 cleaned = _clean_response(raw, prefer=output_language)
                 # Append <image_reference_(N+1)> starting-frame lock to
-                # segment i >= 2 so the H3 prompt explicitly references
-                # the boundary lock image. N+1 = len(user_images) + 1.
-                # (The boundary lock itself is exposed to Hermes as
-                # image_5; the cleaned prompt surfaces it as a fresh
-                # numbered reference so the H3 chain downstream reads
-                # it as the next available slot.)
+                # segment i >= 2. This is node-local metadata on the
+                # cleaned prompt — it is NOT sent to Hermes; only the
+                # same image_paths (image_1..image_4) the user wired
+                # reach the agent.
                 boundary_lock_index = len(image_paths) + 1
                 cleaned = _append_starting_frame_lock(
                     cleaned, seg_index, image_5_path,
