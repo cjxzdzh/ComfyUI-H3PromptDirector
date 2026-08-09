@@ -571,8 +571,19 @@ def _append_starting_frame_lock(
     reorders / drops user images, we still want X = len(user_images) + 1
     (one slot above the last user-provided image), which is what callers
     pass in.
+
+    Skip when:
+      - seg_index < 2 (segment 1 has no previous frame to lock on)
+      - image_5_path is None (no boundary lock supplied)
+      - prompt is empty or very short (< 50 chars) — the underlying
+        Hermes call returned garbage (e.g. "saved to /tmp, now output"
+        meta-prose). Appending the lock block to such garbage would
+        produce a meaningless prompt_2; the user has to debug the
+        upstream call instead.
     """
     if seg_index < 2 or not image_5_path:
+        return prompt
+    if not prompt or len(prompt.strip()) < 50:
         return prompt
     lock_block = (
         f"\n\n[<image_reference_{boundary_lock_index}>]\n"
